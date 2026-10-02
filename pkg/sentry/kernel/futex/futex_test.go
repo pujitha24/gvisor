@@ -20,6 +20,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -531,5 +532,76 @@ func TestMutexStress(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		<-c
+	}
+}
+
+// encodeOp builds a FUTEX_WAKE_OP operation word.
+func encodeOp(op, cmp, opArg, cmpArg uint32) uint32 {
+	return op<<28 | cmp<<24 | (opArg&0xfff)<<12 | cmpArg&0xfff
+}
+
+func TestAtomicOpSigned(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial uint32
+		op      uint32
+		want    bool
+		wantVal uint32
+	}{
+		{
+			// The operation used by Qt 5.15.3's QSemaphore::release().
+			name:    "ANDN shift 31, LT 0, negative old value",
+			initial: 0x80000001,
+			op:      encodeOp(linux.FUTEX_OP_ANDN|linux.FUTEX_OP_OPARG_SHIFT, linux.FUTEX_OP_CMP_LT, 31, 0),
+			want:    true,
+			wantVal: 1,
+		},
+		{
+			name:    "ANDN shift 31, LT 0, positive old value",
+			initial: 1,
+			op:      encodeOp(linux.FUTEX_OP_ANDN|linux.FUTEX_OP_OPARG_SHIFT, linux.FUTEX_OP_CMP_LT, 31, 0),
+			want:    false,
+			wantVal: 1,
+		},
+		{
+			name:    "SET -1",
+			initial: 0,
+			op:      encodeOp(linux.FUTEX_OP_SET, linux.FUTEX_OP_CMP_EQ, 0xfff, 0),
+			want:    true,
+			wantVal: 0xffffffff,
+		},
+		{
+			name:    "ADD -1",
+			initial: 5,
+			op:      encodeOp(linux.FUTEX_OP_ADD, linux.FUTEX_OP_CMP_EQ, 0xfff, 5),
+			want:    true,
+			wantVal: 4,
+		},
+		{
+			name:    "GE -1",
+			initial: 0xffffffff,
+			op:      encodeOp(linux.FUTEX_OP_OR, linux.FUTEX_OP_CMP_GE, 0, 0xfff),
+			want:    true,
+			wantVal: 0xffffffff,
+		},
+		{
+			name:    "GT -1, negative shift count is masked",
+			initial: 0,
+			op:      encodeOp(linux.FUTEX_OP_OR|linux.FUTEX_OP_OPARG_SHIFT, linux.FUTEX_OP_CMP_GT, 0xfff, 0xfff),
+			want:    true,
+			wantVal: 1 << 31,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestData(sizeofInt32)
+			d.SwapUint32(0, tc.initial)
+			got, err := atomicOp(d, 0, tc.op)
+			if err != nil || got != tc.want {
+				t.Errorf("atomicOp: got (%v, %v), wanted (%v, nil)", got, err, tc.want)
+			}
+			if val, _ := d.LoadUint32(0); val != tc.wantVal {
+				t.Errorf("value after atomicOp: got %#x, wanted %#x", val, tc.wantVal)
+			}
+		})
 	}
 }
